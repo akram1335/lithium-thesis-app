@@ -1,18 +1,191 @@
-import streamlit as st
-import pandas as pd
+"""
+Lithium thesis dashboard + reproducible ARMA/ARIMA/LSTM benchmark (single file).
+Dashboard: streamlit run lithium_app.py
+CLI:       python lithium_app.py --benchmark
+"""
+import json
+import os
+import random
+import sys
+import warnings
+from math import sqrt
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import matplotlib.pyplot as plt
-from statsmodels.tsa.arima.model import ARIMA
+import streamlit as st
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, mean_absolute_error
-from math import sqrt
-import os
-import warnings
+from sklearn.preprocessing import MinMaxScaler
+from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
-
 
 warnings.filterwarnings("ignore", message="Non-invertible starting MA parameters found")
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+SPOT_PRICE_FILE = "Lithium Carbonate 99.5_Min China Spot Historical Data.csv"
+USGS_FILE = "ds140-lithium-2021.xlsx"
+WB_FILE = "CMO-Historical-Data-Monthly.xlsx"
+
+try:
+    import torch
+    import torch.nn as nn
+
+    LOOKBACK = 12
+    HIDDEN = 48
+    EPOCHS = 250
+    LR = 1e-3
+
+    class LSTMRegressor(nn.Module):
+        def __init__(self, hidden: int = HIDDEN):
+            super().__init__()
+            self.lstm = nn.LSTM(1, hidden, batch_first=True, num_layers=1)
+            self.fc = nn.Linear(hidden, 1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out, _ = self.lstm(x)
+            return self.fc(out[:, -1, :])
+
+    def _make_sequences(series: np.ndarray, lookback: int) -> tuple[np.ndarray, np.ndarray]:
+        xs, ys = [], []
+        for i in range(lookback, len(series)):
+            xs.append(series[i - lookback : i])
+            ys.append(series[i])
+        return np.stack(xs), np.array(ys)
+
+    def _lstm_iterative_forecast(model, scaler, train_scaled, test_len, lookback, device):
+        model.eval()
+        window = train_scaled[-lookback:].copy()
+        preds_scaled = []
+        with torch.no_grad():
+            for _ in range(test_len):
+                x = torch.tensor(window[-lookback:], dtype=torch.float32, device=device).view(1, lookback, 1)
+                y = model(x).cpu().numpy().ravel()[0]
+                preds_scaled.append(y)
+                window = np.append(window, y)
+        preds_scaled = np.array(preds_scaled).reshape(-1, 1)
+        return scaler.inverse_transform(preds_scaled).ravel()
+
+    def run_lstm_forecast(train: pd.DataFrame, test: pd.DataFrame, seed: int = 42) -> np.ndarray:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        device = torch.device("cpu")
+        scaler = MinMaxScaler()
+        train_s = scaler.fit_transform(train[["Price"]]).ravel()
+        X, y = _make_sequences(train_s, LOOKBACK)
+        X_t = torch.tensor(X, dtype=torch.float32, device=device).unsqueeze(-1)
+        y_t = torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(-1)
+        model = LSTMRegressor(HIDDEN).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=LR)
+        loss_fn = nn.MSELoss()
+        model.train()
+        for _ in range(EPOCHS):
+            opt.zero_grad()
+            pred = model(X_t)
+            loss = loss_fn(pred, y_t)
+            loss.backward()
+            opt.step()
+        return _lstm_iterative_forecast(model, scaler, train_s, len(test), LOOKBACK, device)
+
+    _LSTM_AVAILABLE = True
+except ImportError:
+    LOOKBACK = HIDDEN = EPOCHS = None
+    run_lstm_forecast = None  # type: ignore
+    _LSTM_AVAILABLE = False
+
+
+def _invoked_by_streamlit() -> bool:
+    return any("streamlit" in (a or "").lower() for a in sys.argv)
+
+
+def load_monthly_spot_cli(file_path: str) -> pd.DataFrame:
+    df = pd.read_csv(file_path)
+    df.columns = [c.strip().replace('"', "") for c in df.columns]
+    if not pd.api.types.is_numeric_dtype(df["Price"]):
+        df["Price"] = (
+            df["Price"].astype(str).str.replace(",", "").str.replace('"', "").astype(float)
+        )
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df = df.dropna(subset=["Price"])
+    df = df.sort_values("Date").set_index("Date")
+    monthly = df["Price"].resample("MS").mean().to_frame()
+    monthly.dropna(inplace=True)
+    return monthly
+
+
+def run_benchmark_cli() -> None:
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    root = Path(__file__).resolve().parent
+    csv_path = root / SPOT_PRICE_FILE
+    if not csv_path.exists():
+        raise SystemExit(f"Missing {csv_path}")
+    df = load_monthly_spot_cli(str(csv_path))
+    raw_n = len(pd.read_csv(csv_path))
+    if len(df) < 24:
+        raise SystemExit(f"Need at least 24 monthly points, got {len(df)}")
+    train = df.iloc[:-12]
+    test = df.iloc[-12:]
+    y_test = np.asarray(test["Price"], dtype=np.float64)
+    endog_train = np.asarray(train["Price"].squeeze(), dtype=np.float64)
+    fit_arma = ARIMA(endog_train, order=(2, 0, 2)).fit()
+    fit_arima = ARIMA(endog_train, order=(2, 1, 2)).fit()
+    steps = len(test)
+    pred_arma = np.asarray(fit_arma.get_forecast(steps=steps).predicted_mean, dtype=np.float64)
+    pred_arima = np.asarray(fit_arima.get_forecast(steps=steps).predicted_mean, dtype=np.float64)
+
+    def metrics(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+        return {
+            "model": name,
+            "MAPE": float(mean_absolute_percentage_error(y_true, y_pred)),
+            "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+            "MAE": float(mean_absolute_error(y_true, y_pred)),
+        }
+
+    rows = [
+        metrics("ARMA (2,0,2)", y_test, pred_arma),
+        metrics("ARIMA (2,1,2)", y_test, pred_arima),
+    ]
+    if _LSTM_AVAILABLE and run_lstm_forecast is not None:
+        pred_lstm = run_lstm_forecast(train, test, seed=SEED)
+        rows.append(metrics("LSTM (univariate, iterative 12-step)", y_test, pred_lstm))
+    else:
+        print("Note: PyTorch not available — LSTM skipped.", file=sys.stderr)
+
+    out = {
+        "csv": str(csv_path),
+        "daily_rows": int(raw_n),
+        "monthly_rows": int(len(df)),
+        "monthly_date_start": str(df.index.min().date()),
+        "monthly_date_end": str(df.index.max().date()),
+        "train_months": int(len(train)),
+        "test_months": int(len(test)),
+        "train_period": f"{train.index[0].strftime('%Y-%m')} -- {train.index[-1].strftime('%Y-%m')}",
+        "test_period": f"{test.index[0].strftime('%Y-%m')} -- {test.index[-1].strftime('%Y-%m')}",
+        "lookback": LOOKBACK,
+        "hidden": HIDDEN,
+        "epochs": EPOCHS,
+        "metrics": rows,
+    }
+    print(json.dumps(out, indent=2))
+    out_path = root / "experiment_results.json"
+    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(f"\nWrote {out_path}")
+
+
+if __name__ == "__main__" and "--benchmark" in sys.argv:
+    run_benchmark_cli()
+    raise SystemExit(0)
+if __name__ == "__main__" and not _invoked_by_streamlit():
+    print(
+        "Use:  streamlit run lithium_app.py\n   or:  python lithium_app.py --benchmark",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 st.set_page_config(
@@ -23,18 +196,12 @@ st.set_page_config(
 
 st.title("🔋 Lithium Price Prediction Thesis")
 st.markdown("""
-**Topic:** Lithium price prediction using ARMA and ARIMA analytical methods.
+**Topic:** Lithium price prediction using ARMA, ARIMA, and an LSTM baseline (PyTorch).
 **Data Sources:**
 1.  **Forecasting:** China Spot Price (Daily aggregated to Monthly)
 2.  **Correlations:** World Bank Commodity Data (Monthly)
 3.  **History:** USGS Statistics (Annual Context)
 """)
-
-
-
-SPOT_PRICE_FILE = "Lithium Carbonate 99.5_Min China Spot Historical Data.csv"
-USGS_FILE = "ds140-lithium-2021.xlsx"
-WB_FILE = "CMO-Historical-Data-Monthly.xlsx"
 
 
 
@@ -44,15 +211,12 @@ def parse_daily_csv(file_path):
         df = pd.read_csv(file_path)
 
         df.columns = [c.strip().replace('"', '') for c in df.columns]
-        
 
-        if df['Price'].dtype == object:
+        if not pd.api.types.is_numeric_dtype(df['Price']):
             df['Price'] = df['Price'].astype(str).str.replace(',', '').str.replace('"', '').astype(float)
-            
 
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.sort_values('Date').set_index('Date')
-        
 
         df_monthly = df['Price'].resample('MS').mean().to_frame()
         df_monthly.dropna(inplace=True)
@@ -287,17 +451,19 @@ with tab3:
 
 # --- Tab 4: Model Benchmarking ---
 with tab4:
-    st.subheader("⚖️ Automated Model Comparison (ARMA vs ARIMA)")
+    st.subheader("⚖️ Automated model comparison (ARMA / ARIMA / LSTM)")
     st.markdown("""
-    Run a side-by-side benchmark of the ARMA and ARIMA models on the lithium spot price data.
-    All output charts are saved as **300 DPI PNG** files in the `thesis_figures/` directory.
-    - **ARMA Model** (p=2, d=0, q=2) — Actual vs Forecast
-    - **ARIMA Model** (p=2, d=1, q=2) — Actual vs Forecast
-    - **Error Metrics Comparison** — MAPE, RMSE, MAE
+    Same benchmark as the thesis: **ARMA (2,0,2)**, **ARIMA (2,1,2)**, and a **univariate LSTM** (12-month lookback,
+    iterative 12-step test forecast). Figures save as **300 DPI PNG** under `thesis_figures/`; metrics also go to **`experiment_results.json`**.
     """)
+    if not _LSTM_AVAILABLE:
+        st.info(
+            "PyTorch is not installed — only **ARMA** and **ARIMA** run. "
+            "Install: `pip install torch`, then restart the app."
+        )
 
     if df_spot is not None:
-        generate_figures = st.button("� Run Model Benchmark")
+        generate_figures = st.button("Run full benchmark (ARMA / ARIMA / LSTM)")
 
         if generate_figures:
             FIGURES_DIR = "thesis_figures"
@@ -308,6 +474,7 @@ with tab4:
             forecast_horizon = 12
 
             metrics = {}
+            pred_lstm = None
 
             with st.spinner("Running ARMA model (d=0)..."):
                 try:
@@ -346,6 +513,20 @@ with tab4:
                 except Exception as e:
                     st.error(f"ARIMA model error: {e}")
                     st.stop()
+
+            if _LSTM_AVAILABLE:
+                with st.spinner("Training LSTM (PyTorch, ~250 epochs)..."):
+                    try:
+                        pred_lstm = run_lstm_forecast(train, test, seed=42)
+                        pred_lstm = np.asarray(pred_lstm, dtype=np.float64).ravel()
+                        metrics['LSTM'] = {
+                            'MAPE': mean_absolute_percentage_error(test['Price'], pred_lstm),
+                            'RMSE': sqrt(mean_squared_error(test['Price'], pred_lstm)),
+                            'MAE': mean_absolute_error(test['Price'], pred_lstm),
+                        }
+                    except Exception as e:
+                        st.error(f"LSTM error: {e}")
+                        pred_lstm = None
 
             # --- ARMA Forecast ---
             st.markdown("---")
@@ -387,9 +568,28 @@ with tab4:
             st.pyplot(fig9)
             st.success(f"✅ Saved: `{fig9_path}`")
 
+            if pred_lstm is not None:
+                st.markdown("---")
+                st.markdown("### LSTM — Actual vs Forecast (test window)")
+                fig11, ax11 = plt.subplots(figsize=(12, 6))
+                ax11.plot(train.index, train['Price'], label='Training Data', color='#555555', linewidth=1)
+                ax11.plot(test.index, test['Price'], label='Actual Price', color='#2ca02c', linewidth=2)
+                ax11.plot(test.index, pred_lstm, label='LSTM forecast', color='#9467bd', linewidth=2, linestyle='--')
+                ax11.axvline(x=test.index[0], color='black', linestyle=':', alpha=0.5, label='Forecast start')
+                ax11.set_title('Lithium prices vs univariate LSTM (iterative 12-step)', fontsize=14, fontweight='bold')
+                ax11.set_xlabel('Date', fontsize=12)
+                ax11.set_ylabel('Price (CNY/tonne)', fontsize=12)
+                ax11.legend(loc='upper left', fontsize=10)
+                ax11.grid(True, alpha=0.3)
+                fig11.tight_layout()
+                fig11_path = os.path.join(FIGURES_DIR, "figure_11_lstm_forecast.png")
+                fig11.savefig(fig11_path, dpi=300, bbox_inches='tight')
+                st.pyplot(fig11)
+                st.success(f"✅ Saved: `{fig11_path}`")
+
             # --- Error Metrics Comparison ---
             st.markdown("---")
-            st.markdown("### Forecasting Error Metrics Comparison")
+            st.markdown("### Forecasting error metrics comparison")
 
             metric_names = ['MAPE (%)', 'RMSE', 'MAE']
             arma_vals = [
@@ -402,24 +602,42 @@ with tab4:
                 metrics['ARIMA']['RMSE'],
                 metrics['ARIMA']['MAE'],
             ]
+            if pred_lstm is not None:
+                lstm_vals = [
+                    metrics['LSTM']['MAPE'] * 100,
+                    metrics['LSTM']['RMSE'],
+                    metrics['LSTM']['MAE'],
+                ]
+                bar_labels = ['ARMA (d=0)', 'ARIMA (d=1)', 'LSTM']
+                colors = ['#d62728', '#1f77b4', '#9467bd']
+                fig_w = 18
+            else:
+                lstm_vals = None
+                bar_labels = ['ARMA (d=0)', 'ARIMA (d=1)']
+                colors = ['#d62728', '#1f77b4']
+                fig_w = 15
 
-            fig10, axes10 = plt.subplots(1, 3, figsize=(15, 5))
-            fig10.suptitle('Visual Comparison of Forecasting Errors', fontsize=14, fontweight='bold', y=1.02)
+            fig10, axes10 = plt.subplots(1, 3, figsize=(fig_w, 5))
+            fig10.suptitle('Visual comparison of forecasting errors', fontsize=14, fontweight='bold', y=1.02)
 
-            colors = ['#d62728', '#1f77b4']
-            bar_labels = ['ARMA (d=0)', 'ARIMA (d=1)']
-
-            for idx, (ax, name, arma_v, arima_v) in enumerate(zip(axes10, metric_names, arma_vals, arima_vals)):
-                bars = ax.bar(bar_labels, [arma_v, arima_v], color=colors, width=0.5, edgecolor='white', linewidth=1.5)
+            for idx, ax in enumerate(axes10):
+                name = metric_names[idx]
+                if pred_lstm is not None:
+                    vals = [arma_vals[idx], arima_vals[idx], lstm_vals[idx]]
+                    ymax = max(vals) * 1.15
+                else:
+                    vals = [arma_vals[idx], arima_vals[idx]]
+                    ymax = max(vals) * 1.2
+                bars = ax.bar(bar_labels, vals, color=colors, width=0.55, edgecolor='white', linewidth=1.5)
                 ax.set_title(name, fontsize=13, fontweight='bold')
                 ax.set_ylabel(name, fontsize=11)
                 ax.grid(axis='y', alpha=0.3)
-                # Add value labels on top of bars
-                for bar, val in zip(bars, [arma_v, arima_v]):
+                for bar, val in zip(bars, vals):
                     fmt = f"{val:.2f}%" if idx == 0 else f"{val:,.0f}"
-                    ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + bar.get_height() * 0.02,
-                            fmt, ha='center', va='bottom', fontsize=11, fontweight='bold')
-                ax.set_ylim(0, max(arma_v, arima_v) * 1.2)
+                    h = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width() / 2., h + max(ymax, 1e-9) * 0.02,
+                            fmt, ha='center', va='bottom', fontsize=10, fontweight='bold')
+                ax.set_ylim(0, ymax)
 
             fig10.tight_layout()
             fig10_path = os.path.join(FIGURES_DIR, "figure_10_error_comparison.png")
@@ -429,13 +647,51 @@ with tab4:
 
             # Summary table
             st.markdown("---")
-            st.markdown("### Summary Table")
-            summary_df = pd.DataFrame({
-                'Metric': ['MAPE', 'RMSE', 'MAE'],
-                'ARMA (d=0)': [f"{metrics['ARMA']['MAPE']:.2%}", f"{metrics['ARMA']['RMSE']:,.0f}", f"{metrics['ARMA']['MAE']:,.0f}"],
-                'ARIMA (d=1)': [f"{metrics['ARIMA']['MAPE']:.2%}", f"{metrics['ARIMA']['RMSE']:,.0f}", f"{metrics['ARIMA']['MAE']:,.0f}"],
-            })
+            st.markdown("### Summary table")
+            if pred_lstm is not None:
+                summary_df = pd.DataFrame({
+                    'Metric': ['MAPE', 'RMSE', 'MAE'],
+                    'ARMA (d=0)': [f"{metrics['ARMA']['MAPE']:.2%}", f"{metrics['ARMA']['RMSE']:,.0f}", f"{metrics['ARMA']['MAE']:,.0f}"],
+                    'ARIMA (d=1)': [f"{metrics['ARIMA']['MAPE']:.2%}", f"{metrics['ARIMA']['RMSE']:,.0f}", f"{metrics['ARIMA']['MAE']:,.0f}"],
+                    'LSTM': [f"{metrics['LSTM']['MAPE']:.2%}", f"{metrics['LSTM']['RMSE']:,.0f}", f"{metrics['LSTM']['MAE']:,.0f}"],
+                })
+            else:
+                summary_df = pd.DataFrame({
+                    'Metric': ['MAPE', 'RMSE', 'MAE'],
+                    'ARMA (d=0)': [f"{metrics['ARMA']['MAPE']:.2%}", f"{metrics['ARMA']['RMSE']:,.0f}", f"{metrics['ARMA']['MAE']:,.0f}"],
+                    'ARIMA (d=1)': [f"{metrics['ARIMA']['MAPE']:.2%}", f"{metrics['ARIMA']['RMSE']:,.0f}", f"{metrics['ARIMA']['MAE']:,.0f}"],
+                })
             st.table(summary_df)
 
+            rows_json = [
+                {"model": "ARMA (2,0,2)", "MAPE": float(metrics['ARMA']['MAPE']), "RMSE": float(metrics['ARMA']['RMSE']), "MAE": float(metrics['ARMA']['MAE'])},
+                {"model": "ARIMA (2,1,2)", "MAPE": float(metrics['ARIMA']['MAPE']), "RMSE": float(metrics['ARIMA']['RMSE']), "MAE": float(metrics['ARIMA']['MAE'])},
+            ]
+            if pred_lstm is not None:
+                rows_json.append({
+                    "model": "LSTM (univariate, iterative 12-step)",
+                    "MAPE": float(metrics['LSTM']['MAPE']),
+                    "RMSE": float(metrics['LSTM']['RMSE']),
+                    "MAE": float(metrics['LSTM']['MAE']),
+                })
+            exp = {
+                "csv": os.path.abspath(SPOT_PRICE_FILE),
+                "daily_rows": int(len(pd.read_csv(SPOT_PRICE_FILE))),
+                "monthly_rows": int(len(df_spot)),
+                "monthly_date_start": str(df_spot.index.min().date()),
+                "monthly_date_end": str(df_spot.index.max().date()),
+                "train_months": int(len(train)),
+                "test_months": int(len(test)),
+                "train_period": f"{train.index[0].strftime('%Y-%m')} -- {train.index[-1].strftime('%Y-%m')}",
+                "test_period": f"{test.index[0].strftime('%Y-%m')} -- {test.index[-1].strftime('%Y-%m')}",
+                "lookback": LOOKBACK,
+                "hidden": HIDDEN,
+                "epochs": EPOCHS,
+                "metrics": rows_json,
+            }
+            json_path = os.path.abspath("experiment_results.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(exp, f, indent=2)
+            st.success(f"✅ Wrote `{json_path}`")
     else:
         st.warning("Cannot generate figures: Spot price data not loaded.")
