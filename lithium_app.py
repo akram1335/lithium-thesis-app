@@ -97,6 +97,18 @@ except ImportError:
 
 
 def _invoked_by_streamlit() -> bool:
+    """Detect Streamlit execution.
+
+    ``streamlit run app.py`` rewrites ``sys.argv`` to ``[app.py, ...]`` (no ``streamlit``
+    token). Hosted health checks also rely on the runtime, not argv. Use ScriptRunContext.
+    """
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is not None:
+            return True
+    except Exception:
+        pass
     return any("streamlit" in (a or "").lower() for a in sys.argv)
 
 
